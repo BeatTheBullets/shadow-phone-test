@@ -27,7 +27,8 @@
 <main>
   <h1>Phone speed test</h1>
   <p>Runs the app's four speech models on this phone, to see whether practising and building lessons are fast enough.
-     It downloads about 700 MB the first time, so use WiFi. It takes a few minutes: keep this page open and the screen on.</p>
+     The first run downloads about 700 MB, so use WiFi. It takes about 10 minutes and the page reloads itself between steps.
+     That's normal. Keep this page open and the screen on.</p>
   <button id="run">Run the test</button>
   <div id="status"></div>
   <table id="results" hidden><tbody></tbody></table>
@@ -36,15 +37,25 @@
 </main>
 <script type="module">
 import * as ort from "./ort/ort.wasm.min.mjs";
-import { runBench } from "./bench.js";
+import { STAGES, runStage } from "./bench.js";
 
+// Each step runs in a fresh page (the page reloads in between), because a browser never gives back memory a model used.
+// Progress is kept in localStorage, so a step that crashes the tab is recorded and the test carries on.
 const PARTS = { embed: 1, large: 4, asr: 3 };
+const KEY = "speedtest-v2";
 const $ = (id) => document.getElementById(id);
-const lines = [];
-const log = (m) => { lines.push(m); $("log").textContent = lines.join("\n"); $("log").scrollTop = 1e9; };
-const rows = [];
-const result = (k, v) => { rows.push([k, v]); $("results").hidden = false;
-  $("results").tBodies[0].insertAdjacentHTML("beforeend", `<tr><td>${k}</td><td>${v}</td></tr>`); };
+const fresh = () => ({ rows: [], lines: [], next: 0, running: null });
+let st;
+try { st = JSON.parse(localStorage.getItem(KEY)) || fresh(); } catch (e) { st = fresh(); }
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(st)); } catch (e) {} };
+const render = () => {
+  $("log").textContent = st.lines.join("\n"); $("log").scrollTop = 1e9;
+  $("results").hidden = !st.rows.length;
+  $("results").tBodies[0].innerHTML = st.rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+  $("copy").hidden = !st.rows.length;
+};
+const log = (m) => { st.lines.push(m); save(); render(); };
+const result = (k, v) => { st.rows.push([k, v]); save(); render(); };
 const status = (m) => { $("status").textContent = m; };
 
 async function part(url) {
@@ -58,37 +69,62 @@ async function part(url) {
 }
 
 async function getModel(name) {
-  const parts = [];
-  for (let i = 0; i < PARTS[name]; i++) { status(`Downloading ${name} (${i + 1}/${PARTS[name]})…`); parts.push(await part(`models/${name}.part${i}`)); }
+  const t = performance.now();
+  let parts = [];
+  for (let i = 0; i < PARTS[name]; i++) { status(`Step ${st.next + 1} of ${STAGES.length}: getting ${name} (${i + 1}/${PARTS[name]})…`); parts.push(await part(`models/${name}.part${i}`)); }
   const out = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
   let o = 0; for (const p of parts) { out.set(p, o); o += p.byteLength; }
-  status("Running…");
+  parts = null;
+  log(`${name}: ${(out.byteLength / 1e6).toFixed(0)} MB in ${((performance.now() - t) / 1000).toFixed(1)} s`);
+  status(`Step ${st.next + 1} of ${STAGES.length}: running…`);
   return out;
 }
 
-$("run").onclick = async () => {
-  $("run").disabled = true;
+async function step() {
+  const stage = STAGES[st.next];
   let lock = null;
   try { lock = await navigator.wakeLock?.request("screen"); } catch (e) {}
   const threads = self.crossOriginIsolated ? Math.min(navigator.hardwareConcurrency || 4, 6) : 1;
   ort.env.wasm.numThreads = threads;
   ort.env.wasm.wasmPaths = new URL("./ort/", location.href).href;
-  log(`device: ${navigator.userAgent}`);
-  log(`threads: ${threads} (cross-origin isolated: ${self.crossOriginIsolated}, cores reported: ${navigator.hardwareConcurrency})`);
-  result("Threads used", String(threads));
-  const t = performance.now();
+  if (st.next === 0) {
+    log(`device: ${navigator.userAgent}`);
+    log(`threads: ${threads} (cross-origin isolated: ${self.crossOriginIsolated}, cores reported: ${navigator.hardwareConcurrency})`);
+    result("Threads used", String(threads));
+  }
+  log(`— step ${st.next + 1}: ${stage.label}`);
+  st.running = stage.id; save();
   try {
-    await runBench({ ort, getModel, log, result });
-    status(`Done in ${((performance.now() - t) / 60000).toFixed(1)} min.`);
+    await runStage(stage.id, { ort, getModel, log, result });
   } catch (e) {
     log(`FAILED: ${e && (e.stack || e.message || e)}`);
-    status("The test stopped with an error. Copy the results and send them over.");
+    result(stage.label, `error: ${e && (e.message || e)}`);
   }
+  st.running = null; st.next++; save();
   try { await lock?.release(); } catch (e) {}
-  $("copy").hidden = false;
-};
+  if (st.next < STAGES.length) { status("Reloading for the next step…"); setTimeout(() => location.reload(), 500); }
+  else finish();
+}
+
+function finish() {
+  status("Done. Tap Copy the results and send them over.");
+  $("run").textContent = "Run the test again"; $("run").disabled = false;
+}
+
+// on every page load: carry on where the test was
+render();
+if (st.running) {   // the tab died during that step: almost always iOS closing it for using too much memory
+  const stage = STAGES.find((s) => s.id === st.running);
+  log(`step ${st.next + 1} (${stage.label}) did not finish: the tab was closed and reloaded (most likely out of memory)`);
+  result(stage.label, "tab crashed (memory)");
+  st.running = null; st.next++; save();
+}
+if (st.next > 0 && st.next < STAGES.length) { $("run").disabled = true; setTimeout(step, 1500); }
+else if (st.next >= STAGES.length) finish();
+
+$("run").onclick = () => { st = fresh(); save(); render(); $("run").disabled = true; step(); };
 $("copy").onclick = async () => {
-  const text = rows.map(([k, v]) => `${k}: ${v}`).join("\n") + "\n\n" + lines.join("\n");
+  const text = st.rows.map(([k, v]) => `${k}: ${v}`).join("\n") + "\n\n" + st.lines.join("\n");
   try { await navigator.clipboard.writeText(text); $("copy").textContent = "Copied"; }
   catch (e) { const r = document.createRange(); r.selectNodeContents($("log")); getSelection().removeAllRanges(); getSelection().addRange(r); }
 };
