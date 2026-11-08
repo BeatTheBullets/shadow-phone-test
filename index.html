@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Phone Speed Test</title>
+<script src="coi-serviceworker.min.js"></script>
+<style>
+  :root { --bg: #2b0510; --panel: #3d0a1b; --line: #6b1a33; --fg: #fff; --dim: #d6bac2; --gold: #facc15; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 -apple-system, system-ui, sans-serif;
+    padding: max(20px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) 40px max(16px, env(safe-area-inset-left)); }
+  main { max-width: 560px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  h1 { font-size: 22px; margin: 0; }
+  p { margin: 0; color: var(--dim); }
+  button { font: 600 16px/1 inherit; border: 0; border-radius: 12px; padding: 16px; background: var(--gold); color: var(--bg); }
+  button:disabled { opacity: .5; }
+  button.secondary { background: var(--panel); color: var(--fg); border: 1px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 12px; overflow: hidden; }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--gold); }
+  pre { background: #1c030a; border: 1px solid var(--line); border-radius: 12px; padding: 12px; font-size: 12px; white-space: pre-wrap; margin: 0; max-height: 50vh; overflow: auto; }
+  #status { color: var(--gold); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Phone speed test</h1>
+  <p>Runs the app's four speech models on this phone, to see whether practising and building lessons are fast enough.
+     It downloads about 700 MB the first time, so use WiFi. It takes a few minutes: keep this page open and the screen on.</p>
+  <button id="run">Run the test</button>
+  <div id="status"></div>
+  <table id="results" hidden><tbody></tbody></table>
+  <button id="copy" class="secondary" hidden>Copy the results</button>
+  <pre id="log"></pre>
+</main>
+<script type="module">
+import * as ort from "./ort/ort.wasm.min.mjs";
+import { runBench } from "./bench.js";
+
+const PARTS = { embed: 1, large: 4, asr: 3 };
+const $ = (id) => document.getElementById(id);
+const lines = [];
+const log = (m) => { lines.push(m); $("log").textContent = lines.join("\n"); $("log").scrollTop = 1e9; };
+const rows = [];
+const result = (k, v) => { rows.push([k, v]); $("results").hidden = false;
+  $("results").tBodies[0].insertAdjacentHTML("beforeend", `<tr><td>${k}</td><td>${v}</td></tr>`); };
+const status = (m) => { $("status").textContent = m; };
+
+async function part(url) {
+  let cache = null;
+  try { cache = await caches.open("models-v1"); const hit = await cache.match(url); if (hit) return new Uint8Array(await hit.arrayBuffer()); } catch (e) { cache = null; }
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  const buf = await r.arrayBuffer();
+  try { await cache?.put(url, new Response(buf.slice(0))); } catch (e) { log(`(could not keep ${url} for next time: ${e.message})`); }
+  return new Uint8Array(buf);
+}
+
+async function getModel(name) {
+  const parts = [];
+  for (let i = 0; i < PARTS[name]; i++) { status(`Downloading ${name} (${i + 1}/${PARTS[name]})…`); parts.push(await part(`models/${name}.part${i}`)); }
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
+  let o = 0; for (const p of parts) { out.set(p, o); o += p.byteLength; }
+  status("Running…");
+  return out;
+}
+
+$("run").onclick = async () => {
+  $("run").disabled = true;
+  let lock = null;
+  try { lock = await navigator.wakeLock?.request("screen"); } catch (e) {}
+  const threads = self.crossOriginIsolated ? Math.min(navigator.hardwareConcurrency || 4, 6) : 1;
+  ort.env.wasm.numThreads = threads;
+  ort.env.wasm.wasmPaths = new URL("./ort/", location.href).href;
+  log(`device: ${navigator.userAgent}`);
+  log(`threads: ${threads} (cross-origin isolated: ${self.crossOriginIsolated}, cores reported: ${navigator.hardwareConcurrency})`);
+  result("Threads used", String(threads));
+  const t = performance.now();
+  try {
+    await runBench({ ort, getModel, log, result });
+    status(`Done in ${((performance.now() - t) / 60000).toFixed(1)} min.`);
+  } catch (e) {
+    log(`FAILED: ${e && (e.stack || e.message || e)}`);
+    status("The test stopped with an error. Copy the results and send them over.");
+  }
+  try { await lock?.release(); } catch (e) {}
+  $("copy").hidden = false;
+};
+$("copy").onclick = async () => {
+  const text = rows.map(([k, v]) => `${k}: ${v}`).join("\n") + "\n\n" + lines.join("\n");
+  try { await navigator.clipboard.writeText(text); $("copy").textContent = "Copied"; }
+  catch (e) { const r = document.createRange(); r.selectNodeContents($("log")); getSelection().removeAllRanges(); getSelection().addRange(r); }
+};
+</script>
+</body>
+</html>
